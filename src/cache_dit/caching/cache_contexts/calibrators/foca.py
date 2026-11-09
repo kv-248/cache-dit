@@ -65,9 +65,12 @@
 #
 #   Heun corrector (anchored to most recent full-compute step):
 #     elapsed = current_step - last_full_step
-#     deriv_full = F_full - F_full_prev  # reliable derivative at full-compute anchor
-#     deriv_curr = F_k - F_km1           # local derivative (may contain cache drift)
+#     deriv_full = (F_full - F_full_prev) / (last_full_step - prev_full_step)
+#     deriv_curr = (F_k - F_km1) / (step_k - step_km1)
 #     F_heun = F_full + (elapsed / 2) * (deriv_full + deriv_curr)
+#   Both derivatives are per-step rates. A cache streak leaves the two anchors, and sometimes
+#   the rolling window, more than one step apart; dividing by that gap is what keeps a linear
+#   trajectory linear. Using the raw delta as if it were one step overshoots the forecast.
 #
 #   The Heun formula is the trapezoidal rule: start from the full-compute
 #   anchor F_full, advance by elapsed steps, using the average of (a) the
@@ -86,8 +89,8 @@
 #   cache_manager.get_Bn_buffer()          # cache hit → need forecast
 #     → FoCaCalibrator.approximate()
 #       → FoCaState.approximate()
-#         → BDF2: 2 * F_k - F_km1
-#         → Heun: + 0.5 * (deriv_full - deriv_curr)
+#         → per-step anchor and local derivatives
+#         → Heun: F_full + (elapsed / 2) * (deriv_full + deriv_curr)
 #         → advance F_k, F_km1 with prediction
 #
 #   cache_manager.set_Bn_buffer()          # full-compute step → store truth
@@ -123,6 +126,9 @@ class FoCaState:
     self.F_km1: torch.Tensor | None = None
     self.F_full: torch.Tensor | None = None
     self.F_full_prev: torch.Tensor | None = None
+    # Steps at which F_k and F_km1 were written. -1 means that slot is empty.
+    self.step_k = -1
+    self.step_km1 = -1
 
   def reset(self):
     """Clear all stored tensors and step counters."""
@@ -134,6 +140,8 @@ class FoCaState:
     self.F_km1 = None
     self.F_full = None
     self.F_full_prev = None
+    self.step_k = -1
+    self.step_km1 = -1
 
   def mark_step_begin(self):
     """Advance the logical step counter by one."""
@@ -147,7 +155,11 @@ class FoCaState:
     """
 
     if self.F_k is not None and Y.shape != self.F_k.shape:
+      # `mark_step_begin` already advanced the clock for this step. `reset` is for a new
+      # inference and rewinds that clock; keep the current step so later gaps stay real.
+      step = self.current_step
       self.reset()
+      self.current_step = step
 
   def update(self, Y: torch.Tensor):
     """Commit a fully computed tensor as the newest full-compute anchor.
@@ -164,7 +176,9 @@ class FoCaState:
     self.last_full_step = self.current_step
     self.F_full_prev = self.F_full
     self.F_full = Y.detach().clone()
+    self.step_km1 = self.step_k
     self.F_km1 = self.F_k
+    self.step_k = self.current_step
     self.F_k = Y.detach().clone()
 
   def approximate(self) -> torch.Tensor:
@@ -172,9 +186,10 @@ class FoCaState:
 
     Anchors the prediction to the most recent full-compute step F_full and advances by
     ``elapsed`` steps using the average of the anchor derivative and the local derivative.
-    For large cache gaps (elapsed > 3), the extrapolation is damped toward the anchor to
-    prevent divergence on non-linear feature trajectories.  Falls back to reusing F_full
-    when insufficient data is available.
+    Each derivative is the tensor delta divided by the number of steps that delta spans, so
+    a cache gap does not inflate the slope. For large cache gaps (elapsed > 3), the
+    extrapolation is damped toward the anchor to prevent divergence on non-linear feature
+    trajectories. Falls back to reusing F_full when insufficient data is available.
 
     :returns: The forecast tensor for the current logical step.
     """
@@ -185,8 +200,12 @@ class FoCaState:
       return self.F_full.clone() if self.F_full is not None else self.F_k.clone()
 
     elapsed = float(self.current_step - self.last_full_step)
-    deriv_full = self.F_full - self.F_full_prev
-    deriv_curr = self.F_k - self.F_km1
+    # Per-step rates. `prev_full_step` / `step_km1` are the steps the older tensor was
+    # recorded at; a gap of 1 reproduces the previous (adjacent-step) formula exactly.
+    anchor_gap = max(self.last_full_step - self.prev_full_step, 1)
+    local_gap = max(self.step_k - self.step_km1, 1)
+    deriv_full = (self.F_full - self.F_full_prev) / anchor_gap
+    deriv_curr = (self.F_k - self.F_km1) / local_gap
     # Heun trapezoidal rule anchored to the most recent full-compute step.
     # Clamp the effective horizon to at most 3 steps — beyond that the linear
     # assumption breaks down on real denoising trajectories and the prediction
@@ -200,7 +219,9 @@ class FoCaState:
       F_heun3 = self.F_full + (max_horizon / 2.0) * (deriv_full + deriv_curr)
       F_pred = w * F_heun3 + (1.0 - w) * self.F_full
 
+    self.step_km1 = self.step_k
     self.F_km1 = self.F_k
+    self.step_k = self.current_step
     self.F_k = F_pred.detach().clone()
     return F_pred
 

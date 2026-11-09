@@ -108,3 +108,59 @@ def test_foca_calibrator_multi_stream():
   pred_bn = foca.approximate(name="Bn")
   pred_enc = foca.approximate(name="Bn_encoder")
   assert not torch.allclose(pred_bn, pred_enc)
+
+
+def test_foca_linear_extrapolation_across_anchor_gap():
+  """A linear series stays linear after full-compute anchors are more than one step apart.
+
+  DBCache recomputes, caches a streak, then recomputes. The anchor derivative is the change
+  between those two recomputes, so it has to be a per-step rate. Treating the whole jump as one
+  step makes the next forecast overshoot (6 instead of 5 on ``y = t``).
+  """
+  foca = FoCaCalibrator()
+  full = {0: 0.0, 1: 1.0, 4: 4.0}
+  for step in range(6):
+    foca.mark_step_begin()
+    if step in full:
+      foca.update(torch.tensor(full[step], dtype=torch.float32))
+      continue
+    pred = foca.approximate()
+    assert pred.item() == pytest.approx(float(step), abs=1e-5)
+
+
+def test_foca_linear_extrapolation_when_rolling_window_spans_steps():
+  """The local derivative is also a per-step rate when the rolling window skips a step.
+
+  With a single anchor, the cache step reuses that anchor and does not advance the window. The
+  next full compute therefore spans two steps, and the following forecast must not treat that
+  jump as a one-step slope (``y = 2t`` would predict 8 instead of 6).
+  """
+  foca = FoCaCalibrator()
+  foca.mark_step_begin()
+  foca.update(torch.tensor(0.0, dtype=torch.float32))
+  foca.mark_step_begin()
+  assert foca.approximate().item() == pytest.approx(0.0, abs=1e-5)
+  foca.mark_step_begin()
+  foca.update(torch.tensor(4.0, dtype=torch.float32))
+  foca.mark_step_begin()
+  assert foca.approximate().item() == pytest.approx(6.0, abs=1e-5)
+
+
+def test_foca_shape_change_keeps_step_counter():
+  """A shape change clears history without rewinding the step clock.
+
+  The first ``mark_step_begin`` lands before the named state exists, so the live counter is the
+  second call (step 0). Resetting inside the shape change used to rewind that counter to -1, and
+  the next step was numbered 0 again.
+  """
+  foca = FoCaCalibrator()
+  foca.mark_step_begin()
+  foca.update(torch.randn(2, 32, 512), name="test")
+  foca.mark_step_begin()
+  foca.update(torch.randn(4, 32, 512), name="test")
+  state = foca.states["test"]
+  assert state.F_km1 is None
+  assert state.current_step == 0
+  assert state.last_full_step == 0
+  foca.mark_step_begin()
+  assert state.current_step == 1

@@ -593,8 +593,8 @@ $$F_{pred} = F_{full} + \frac{\text{elapsed}}{2} \cdot \big( \text{deriv}_{full}
 where:
 - $F_{full}$ is the feature tensor at the most recent full-compute step
 - $\text{elapsed}$ is the number of steps since that full-compute anchor
-- $\text{deriv}_{full} = F_{full} - F_{full\_prev}$ is the reliable derivative at the anchor
-- $\text{deriv}_{curr} = F_k - F_{km1}$ is the local derivative from the two most recent values
+- $\text{deriv}_{full} = (F_{full} - F_{full\_prev}) / (t_{full} - t_{full\_prev})$ is the per-step derivative between the two most recent full-compute anchors
+- $\text{deriv}_{curr} = (F_k - F_{km1}) / (t_k - t_{km1})$ is the per-step derivative of the two most recent values
 
 The Heun trapezoidal rule takes the **average** of the anchor derivative and the local derivative. When the feature evolution is near-linear, the average equals either derivative and FoCa matches linear extrapolation. When the local derivative deviates (cache drift), the anchor derivative pulls the prediction back toward the reliable trend — suppressing overshoot that would otherwise accumulate in recursive prediction. For example:
 
