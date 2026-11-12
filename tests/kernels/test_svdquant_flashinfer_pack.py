@@ -137,6 +137,21 @@ def test_fp4_scale_swizzle_roundtrip_with_odd_columns() -> None:
   assert torch.equal(restored.view(torch.uint8), scales.view(torch.uint8))
 
 
+@pytest.mark.parametrize("rows,cols", [(256, 3), (200, 5), (129, 1)])
+def test_fp4_scale_swizzle_roundtrip_across_row_tiles(rows: int, cols: int) -> None:
+  """A second 128-row tile must not alias the previous one when cols is not a multiple of 4.
+
+  The buffer is padded to a multiple of 4 columns, but the row-tile stride used the unpadded count.
+  For 256 rows and 3 columns that maps 96 logical scales onto offsets already occupied by the first
+  tile, so unswizzle returns the overwritten bytes.
+  """
+  scales = torch.arange(rows * cols, dtype=torch.int32).remainder(256).to(torch.uint8)
+  scales = scales.view(rows, cols).view(torch.float8_e4m3fn)
+  flat = swizzle_fp4_scales(scales)
+  restored = unswizzle_fp4_scales(flat, rows, cols)
+  assert torch.equal(restored.view(torch.uint8), scales.view(torch.uint8))
+
+
 def test_flashinfer_pack_requires_channel_scales() -> None:
   module = _make_module()
   with pytest.raises(ValueError, match="wcscales"):

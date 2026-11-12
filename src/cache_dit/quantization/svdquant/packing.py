@@ -163,8 +163,11 @@ def _fp4_scale_swizzle_offsets(rows: int, cols: int, device: torch.device) -> to
   """
   row = torch.arange(rows, device=device).view(-1, 1).expand(rows, cols)
   col = torch.arange(cols, device=device).view(1, -1).expand(rows, cols)
-  return ((row // 128) * (cols * 128) + (col // 4) * 512 + 16 * (row % 32) + 4 * ((row // 32) % 4) +
-          col % 4)
+  # Each column group occupies a 128x4 tile. The next row tile has to start after that padded
+  # tile; `cols * 128` aliases it onto the previous tile whenever cols is not a multiple of 4.
+  padded_cols = ceil_divide(cols, 4) * 4
+  return ((row // 128) * (padded_cols * 128) + (col // 4) * 512 + 16 * (row % 32) + 4 *
+          ((row // 32) % 4) + col % 4)
 
 
 def _padded_fp4_scale_size(rows: int, cols: int) -> int:
